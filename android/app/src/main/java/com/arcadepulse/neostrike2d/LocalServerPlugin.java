@@ -47,6 +47,9 @@ public class LocalServerPlugin extends Plugin {
     private EmbeddedGameServer gameServer;
     private int boundPort = 3000;
     private String currentRoomCode = "7942";
+
+    private volatile boolean serverReady = false;
+    private volatile Exception serverStartError = null;
     private DiscoveryResponder discoveryResponder;
     private ScheduledExecutorService scheduler;
 
@@ -434,11 +437,16 @@ public class LocalServerPlugin extends Plugin {
         @Override
         public void onError(WebSocket conn, Exception ex) {
             Log.e(TAG, "WS Server Error", ex);
+
+            if (!serverReady) {
+                serverStartError = ex;
+            }
         }
 
         @Override
         public void onStart() {
-            Log.d(TAG, "Embedded GameServer started successfully on port " + getPort());
+            serverReady = true;
+            Log.d(TAG, "LISTENING 0.0.0.0:" + getPort());
         }
     }
 
@@ -527,54 +535,110 @@ public class LocalServerPlugin extends Plugin {
 
         stopAllServers();
 
-        // Try ports from requested up to port+10
-        int chosenPort = port;
-        boolean started = false;
+        serverReady = false;
+        serverStartError = null;
 
-        for (int p = port; p <= port + 10; p++) {
-            try {
-                gameServer = new EmbeddedGameServer(new InetSocketAddress("0.0.0.0", p));
-                gameServer.start();
-                chosenPort = p;
-                started = true;
-                break;
-            } catch (Exception e) {
-                Log.w(TAG, "Port " + p + " busy, trying next...", e);
+        scheduler.execute(() -> {
+            int chosenPort = port;
+            boolean started = false;
+
+            for (int p = port; p <= port + 10; p++) {
+                serverReady = false;
+                serverStartError = null;
+
+                try {
+                    gameServer = new EmbeddedGameServer(
+                        new InetSocketAddress("0.0.0.0", p)
+                    );
+
+                    gameServer.start();
+
+                    long deadline = System.currentTimeMillis() + 5000;
+
+                    while (!serverReady &&
+                           serverStartError == null &&
+                           System.currentTimeMillis() < deadline) {
+                        Thread.sleep(50);
+                    }
+
+                    if (serverReady) {
+                        chosenPort = p;
+                        started = true;
+                        break;
+                    }
+
+                    Exception error = serverStartError;
+
+                    try {
+                        gameServer.stop();
+                    } catch (Exception stopError) {
+                        Log.w(TAG, "Error stopping failed server", stopError);
+                    }
+
+                    gameServer = null;
+
+                    if (error != null) {
+                        Log.w(TAG, "Port " + p + " failed to start", error);
+                    } else {
+                        Log.w(TAG, "Port " + p + " did not become ready within 5 seconds");
+                    }
+
+                } catch (Exception e) {
+                    Log.w(TAG, "Port " + p + " failed", e);
+
+                    if (gameServer != null) {
+                        try {
+                            gameServer.stop();
+                        } catch (Exception stopError) {
+                            Log.w(TAG, "Error stopping failed server", stopError);
+                        }
+                        gameServer = null;
+                    }
+                }
             }
-        }
 
-        if (!started) {
-            call.reject("Could not bind embedded WebSocket server to ports " + port + "-" + (port + 10));
-            return;
-        }
+            if (!started) {
+                serverReady = false;
+                call.reject(
+                    "Could not start embedded WebSocket server on ports "
+                    + port + "-" + (port + 10)
+                );
+                return;
+            }
 
-        this.boundPort = chosenPort;
+            this.boundPort = chosenPort;
 
-        // Start UDP discovery responder
-        try {
-            discoveryResponder = new DiscoveryResponder();
-            discoveryResponder.start();
-        } catch (Exception e) {
-            Log.w(TAG, "Could not start UDP discovery responder", e);
-        }
+            try {
+                discoveryResponder = new DiscoveryResponder();
+                discoveryResponder.start();
+            } catch (Exception e) {
+                Log.w(TAG, "Could not start UDP discovery responder", e);
+            }
 
-        String primaryIp = getPrimaryLocalIp();
-        List<String> allIps = getAllLocalIps();
+            String primaryIp = getPrimaryLocalIp();
+            List<String> allIps = getAllLocalIps();
 
-        JSObject ret = new JSObject();
-        ret.put("success", true);
-        ret.put("port", chosenPort);
-        ret.put("host", primaryIp);
-        ret.put("roomCode", currentRoomCode);
+            JSObject ret = new JSObject();
+            ret.put("success", true);
+            ret.put("port", chosenPort);
+            ret.put("host", primaryIp);
+            ret.put("roomCode", currentRoomCode);
 
-        JSArray ipsArr = new JSArray();
-        for (String ip : allIps) {
-            ipsArr.put(ip);
-        }
-        ret.put("localIps", ipsArr);
+            JSArray ipsArr = new JSArray();
+            for (String ip : allIps) {
+                ipsArr.put(ip);
+            }
+            ret.put("localIps", ipsArr);
 
-        Log.d(TAG, "Embedded Local Server active on " + primaryIp + ":" + chosenPort + " [Room: " + currentRoomCode + "]");
-        call.resolve(ret);
+            Log.d(
+                TAG,
+                "Embedded Local Server active on "
+                + primaryIp + ":" + chosenPort
+                + " [Room: " + currentRoomCode + "]"
+            );
+
+            call.resolve(ret);
+        });
     }
 
     @PluginMethod

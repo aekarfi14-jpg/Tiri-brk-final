@@ -53,6 +53,7 @@ export default function App() {
   // TV server routing metadata
   const [tvHost, setTvHost] = useState<string>('');
   const [tvPort, setTvPort] = useState<number>(3000);
+  const [tvServerReady, setTvServerReady] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [phoneConnectionState, setPhoneConnectionState] = useState<
@@ -72,12 +73,42 @@ export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<any>(null);
 
-  // Auto-start Local Server when TV Mode is chosen
+  // Keep connection callbacks stable while reading the latest state.
+  const roomCodeRef = useRef(roomCode);
+  const phonePlayerIdRef = useRef(phonePlayerId);
+  const phoneNameRef = useRef(phoneName);
+  const phoneTeamRef = useRef(phoneTeam);
+  const phoneSlotRef = useRef(phoneSlot);
+  const matchStateRef = useRef(matchState);
+
+  roomCodeRef.current = roomCode;
+  phonePlayerIdRef.current = phonePlayerId;
+  phoneNameRef.current = phoneName;
+  phoneTeamRef.current = phoneTeam;
+  phoneSlotRef.current = phoneSlot;
+  matchStateRef.current = matchState;
+
+  // Start the native TV server first. WebSocket connection is gated on tvServerReady.
   useEffect(() => {
-    if (mode === 'tv') {
-      startLocalHostServer(3000, roomCode || '7942').then((res) => {
+    let cancelled = false;
+
+    if (mode !== 'tv') {
+      setTvServerReady(false);
+      return;
+    }
+
+    setTvServerReady(false);
+    setConnectionError(null);
+
+    (async () => {
+      try {
+        const res = await startLocalHostServer(3000, roomCodeRef.current || '7942');
+
+        if (cancelled) return;
+
         if (!res.success) {
-          console.error('Failed to start local TV server');
+          setConnectionError('تعذر تشغيل خادم الشبكة المحلية على التلفاز');
+          setTvServerReady(false);
           return;
         }
 
@@ -94,25 +125,36 @@ export default function App() {
           setTvHost(res.host);
         }
 
-        if (Array.isArray(res.localIps)) {
-      
-          // Prefer a real LAN IPv4 address for QR/join information.
-          if (
-            (!res.host ||
-              res.host === 'localhost' ||
-              res.host === '127.0.0.1' ||
-              res.host === '0.0.0.0') &&
-            res.localIps.length > 0
-          ) {
+        if (Array.isArray(res.localIps) && res.localIps.length > 0) {
+          const validHost =
+            res.host &&
+            res.host !== 'localhost' &&
+            res.host !== '127.0.0.1' &&
+            res.host !== '0.0.0.0';
+
+          if (!validHost) {
             setTvHost(res.localIps[0]);
           }
         }
-      });
-    }
-    return () => {
-      if (mode === 'tv') {
-        stopLocalHostServer();
+
+        setTvServerReady(true);
+      } catch (err) {
+        if (cancelled) return;
+
+        console.error('Failed to start local TV server:', err);
+        setConnectionError(
+          err instanceof Error
+            ? err.message
+            : 'تعذر تشغيل خادم الشبكة المحلية'
+        );
+        setTvServerReady(false);
       }
+    })();
+
+    return () => {
+      cancelled = true;
+      setTvServerReady(false);
+      void stopLocalHostServer();
     };
   }, [mode]);
 
@@ -185,18 +227,18 @@ export default function App() {
           ws.send(
             JSON.stringify({
               type: 'tv:create_room',
-              code: roomCode || undefined,
+              code: roomCodeRef.current || undefined,
             })
           );
-        } else if (mode === 'phone' && roomCode) {
+        } else if (mode === 'phone' && roomCodeRef.current) {
           // Register as phone controller (sends playerId to reclaim reserved slot if reconnecting)
           ws.send(
             JSON.stringify({
               type: 'phone:join_room',
-              code: roomCode,
-              playerId: phonePlayerId || undefined,
-              name: phoneName,
-              team: phoneTeam,
+              code: roomCodeRef.current,
+              playerId: phonePlayerIdRef.current || undefined,
+              name: phoneNameRef.current,
+              team: phoneTeamRef.current,
             })
           );
         }
@@ -294,7 +336,7 @@ export default function App() {
           }
 
           if (msg.type === 'player:input') {
-            if (engineRef.current && matchState !== 'LOBBY') {
+            if (engineRef.current && matchStateRef.current !== 'LOBBY') {
               engineRef.current.handleInput(msg.slot, msg.inputs);
             }
           }
@@ -370,7 +412,7 @@ export default function App() {
 
       ws.onclose = () => {
         setIsWsConnected(false);
-        if (mode === 'phone' && phoneSlot !== null) {
+        if (mode === 'phone' && phoneSlotRef.current !== null) {
           setPhoneConnectionState('RECONNECTING');
         }
         // Attempt reconnect after 2 seconds
@@ -384,14 +426,18 @@ export default function App() {
       clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = setTimeout(connectWebSocket, 2500);
     }
-  }, [mode, roomCode, phonePlayerId, phoneName, phoneTeam, matchState, targetHost, targetPort]);
+  }, [mode, targetHost, targetPort]);
 
-  // Connect whenever TV or Phone mode is chosen
+  // Connect only after the TV server is actually ready.
+  // Phone connects only when a room/host has been selected.
   useEffect(() => {
     if (mode === 'tv') {
+      if (!tvServerReady) return;
       connectWebSocket();
     } else if (mode === 'phone' && roomCode) {
       connectWebSocket();
+    } else {
+      return;
     }
 
     return () => {
@@ -401,7 +447,7 @@ export default function App() {
         wsRef.current = null;
       }
     };
-  }, [mode, roomCode, connectWebSocket]);
+  }, [mode, roomCode, tvServerReady, connectWebSocket]);
 
   // Periodic Ping for Phone mode to measure latency and keep connection alive
   useEffect(() => {

@@ -41,14 +41,12 @@ export async function startLocalHostServer(
       const res = await LocalServer.startServer({ port, roomCode });
       return res;
     } catch (err) {
-      console.warn('Native LocalServerPlugin error, falling back to local defaults:', err);
-      return {
-        success: true,
-        port: 3000,
-        host: '127.0.0.1',
-        roomCode,
-        localIps: ['127.0.0.1'],
-      };
+      console.error('Native LocalServerPlugin failed to start:', err);
+      throw new Error(
+        err instanceof Error
+          ? `تعذر تشغيل خادم الشبكة المحلية: ${err.message}`
+          : 'تعذر تشغيل خادم الشبكة المحلية'
+      );
     }
   }
 
