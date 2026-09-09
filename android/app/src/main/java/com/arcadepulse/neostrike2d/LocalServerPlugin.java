@@ -603,14 +603,15 @@ public class LocalServerPlugin extends Plugin {
 
     @PluginMethod
     public void searchHosts(PluginCall call) {
-        // Run on background thread
         Executors.newSingleThreadExecutor().execute(() -> {
             WifiManager.MulticastLock lock = null;
-            DatagramSocket searchSocket = null;
+            DatagramSocket socket = null;
+
             try {
                 Context ctx = getContext();
                 if (ctx != null) {
-                    WifiManager wm = (WifiManager) ctx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                    WifiManager wm = (WifiManager) ctx.getApplicationContext()
+                            .getSystemService(Context.WIFI_SERVICE);
                     if (wm != null) {
                         lock = wm.createMulticastLock("TiriStrikeDiscovery");
                         lock.setReferenceCounted(true);
@@ -618,66 +619,133 @@ public class LocalServerPlugin extends Plugin {
                     }
                 }
 
-                searchSocket = new DatagramSocket();
-                searchSocket.setBroadcast(true);
-                searchSocket.setSoTimeout(2200);
+                socket = new DatagramSocket();
+                socket.setBroadcast(true);
+                socket.setSoTimeout(300);
 
-                byte[] req = "TIRI_DISCOVER_REQ".getBytes(StandardCharsets.UTF_8);
+                byte[] requestData =
+                        "TIRI_DISCOVER_REQ".getBytes(StandardCharsets.UTF_8);
 
-                // Broadcast to standard 255.255.255.255
-                DatagramPacket p1 = new DatagramPacket(req, req.length, InetAddress.getByName("255.255.255.255"), DISCOVERY_PORT);
-                searchSocket.send(p1);
+                List<String> broadcasts = new ArrayList<>();
 
-                // Also try common Hotspot gateway/broadcast 192.168.43.255
                 try {
-                    DatagramPacket p2 = new DatagramPacket(req, req.length, InetAddress.getByName("192.168.43.255"), DISCOVERY_PORT);
-                    searchSocket.send(p2);
+                    Enumeration<NetworkInterface> interfaces =
+                            NetworkInterface.getNetworkInterfaces();
+
+                    if (interfaces != null) {
+                        for (NetworkInterface iface :
+                                Collections.list(interfaces)) {
+                            try {
+                                if (iface.isLoopback() || !iface.isUp()) continue;
+
+                                for (java.net.InterfaceAddress ia :
+                                        iface.getInterfaceAddresses()) {
+
+                                    InetAddress broadcast = ia.getBroadcast();
+
+                                    if (broadcast instanceof java.net.Inet4Address) {
+                                        String address = broadcast.getHostAddress();
+                                        if (address != null &&
+                                                !broadcasts.contains(address)) {
+                                            broadcasts.add(address);
+                                        }
+                                    }
+                                }
+                            } catch (Exception ignored) {}
+                        }
+                    }
                 } catch (Exception ignored) {}
 
-                long endTime = System.currentTimeMillis() + 2200;
-                JSArray foundHosts = new JSArray();
-                List<String> seenHosts = new ArrayList<>();
-
-                byte[] buf = new byte[1024];
-                while (System.currentTimeMillis() < endTime) {
-                    try {
-                        DatagramPacket responsePacket = new DatagramPacket(buf, buf.length);
-                        searchSocket.receive(responsePacket);
-
-                        String resp = new String(responsePacket.getData(), 0, responsePacket.getLength(), StandardCharsets.UTF_8);
-                        if (resp.contains("TIRI_HOST_RES")) {
-                            JSONObject obj = new JSONObject(resp);
-                            String host = obj.optString("host", responsePacket.getAddress().getHostAddress());
-                            int port = obj.optInt("port", 3000);
-                            String room = obj.optString("room", "");
-
-                            String key = host + ":" + port;
-                            if (!seenHosts.contains(key)) {
-                                seenHosts.add(key);
-                                JSObject item = new JSObject();
-                                item.put("host", host);
-                                item.put("port", port);
-                                item.put("room", room);
-                                foundHosts.put(item);
-                            }
-                        }
-                    } catch (Exception timeout) {
-                        break;
-                    }
+                if (!broadcasts.contains("255.255.255.255")) {
+                    broadcasts.add("255.255.255.255");
                 }
 
-                JSObject res = new JSObject();
-                res.put("hosts", foundHosts);
-                call.resolve(res);
+                if (!broadcasts.contains("192.168.43.255")) {
+                    broadcasts.add("192.168.43.255");
+                }
+
+                for (String address : broadcasts) {
+                    try {
+                        DatagramPacket packet = new DatagramPacket(
+                                requestData,
+                                requestData.length,
+                                InetAddress.getByName(address),
+                                DISCOVERY_PORT
+                        );
+                        socket.send(packet);
+                    } catch (Exception ignored) {}
+                }
+
+                long deadline = System.currentTimeMillis() + 2500L;
+
+                JSArray hosts = new JSArray();
+                List<String> seen = new ArrayList<>();
+                byte[] buffer = new byte[2048];
+
+                while (System.currentTimeMillis() < deadline) {
+                    try {
+                        DatagramPacket packet =
+                                new DatagramPacket(buffer, buffer.length);
+
+                        socket.receive(packet);
+
+                        String response = new String(
+                                packet.getData(),
+                                0,
+                                packet.getLength(),
+                                StandardCharsets.UTF_8
+                        );
+
+                        if (!response.contains("TIRI_HOST_RES")) continue;
+
+                        JSONObject obj = new JSONObject(response);
+
+                        String host = obj.optString(
+                                "host",
+                                packet.getAddress().getHostAddress()
+                        );
+
+                        int port = obj.optInt("port", 3000);
+                        String room = obj.optString("room", "");
+
+                        if (host.trim().isEmpty()) continue;
+                        if (port <= 0) port = 3000;
+
+                        String key = host + ":" + port + ":" + room;
+
+                        if (!seen.contains(key)) {
+                            seen.add(key);
+
+                            JSObject item = new JSObject();
+                            item.put("host", host);
+                            item.put("port", port);
+                            item.put("room", room);
+                            hosts.put(item);
+                        }
+
+                    } catch (java.net.SocketTimeoutException ignored) {
+                    } catch (Exception ignored) {}
+                }
+
+                JSObject result = new JSObject();
+                result.put("hosts", hosts);
+                call.resolve(result);
 
             } catch (Exception e) {
                 Log.e(TAG, "Search hosts error", e);
-                JSObject res = new JSObject();
-                res.put("hosts", new JSArray());
-                call.resolve(res);
+
+                JSObject result = new JSObject();
+                result.put("hosts", new JSArray());
+                call.resolve(result);
+
             } finally {
-                if (searchSocket != null && !searchSocket.isClosed()) searchSocket.close();
-                if (lock != null && lock.isHeld()) lock.release();
+                if (socket != null && !socket.isClosed()) {
+                    socket.close();
+                }
+
+                if (lock != null && lock.isHeld()) {
+                    lock.release();
+                }
             }
         });
     }

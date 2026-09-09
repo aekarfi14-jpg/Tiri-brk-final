@@ -12,6 +12,7 @@ import {
   ChevronUp,
 } from 'lucide-react';
 import { sound } from '../../audio/soundEngine.ts';
+import { discoverLanHosts } from '../../network/nativeServer.ts';
 import { MAX_PLAYERS } from '../../types.ts';
 
 export interface PhoneConnectionPayload {
@@ -41,6 +42,75 @@ export const PhoneScanner: React.FC<PhoneScannerProps> = ({
   const [manualHost, setManualHost] = useState('');
   const [manualPort, setManualPort] = useState('3000');
 
+  const [isDiscovering, setIsDiscovering] = useState(false);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+
+  const connectUsingRoomDiscovery = async (roomCode: string) => {
+    const cleanRoom = roomCode.toUpperCase().trim();
+    if (cleanRoom.length < 3) return;
+
+    setDiscoveryError(null);
+    setIsDiscovering(true);
+
+    try {
+      const hosts = await discoverLanHosts();
+
+      const matches = hosts.filter(
+        (item) =>
+          item &&
+          item.room &&
+          item.room.toUpperCase().trim() === cleanRoom &&
+          item.host
+      );
+
+      if (matches.length === 0) {
+        setDiscoveryError(
+          'ما لقيناش التلفاز في الشبكة. تأكد بلي الهاتف والتلفاز في نفس Wi-Fi أو نقطة الاتصال.'
+        );
+        return;
+      }
+
+      const target = matches[0];
+
+      sound.playClick();
+
+      onConnect({
+        roomCode: cleanRoom,
+        host: target.host,
+        port: Number(target.port) > 0 ? Number(target.port) : 3000,
+      });
+    } catch (err) {
+      console.warn('LAN room discovery failed:', err);
+      setDiscoveryError(
+        'تعذر البحث عن التلفاز داخل الشبكة المحلية. جرّب IP التلفاز من الإعدادات المتقدمة.'
+      );
+    } finally {
+      setIsDiscovering(false);
+    }
+  };
+
+  const connectToRoom = (
+    roomCode: string,
+    host?: string,
+    port?: number
+  ) => {
+    const cleanRoom = roomCode.toUpperCase().trim();
+    if (cleanRoom.length < 3) return;
+
+    const cleanHost = host?.trim();
+
+    if (cleanHost && cleanHost !== 'localhost' && cleanHost !== '127.0.0.1') {
+      onConnect({
+        roomCode: cleanRoom,
+        host: cleanHost,
+        port: Number(port) > 0 ? Number(port) : 3000,
+      });
+      return;
+    }
+
+    void connectUsingRoomDiscovery(cleanRoom);
+  };
+
   // Camera states
   const [hasCamera, setHasCamera] = useState(true);
   const [cameraError, setCameraError] = useState<string | null>(null);
@@ -53,11 +123,11 @@ export const PhoneScanner: React.FC<PhoneScannerProps> = ({
       const urlParams = new URLSearchParams(window.location.search);
       const hostParam = urlParams.get('host') || undefined;
       const portParam = urlParams.get('port') ? Number(urlParams.get('port')) : undefined;
-      onConnect({
-        roomCode: initialCode.toUpperCase().trim(),
-        host: hostParam,
-        port: portParam,
-      });
+      connectToRoom(
+        initialCode.toUpperCase().trim(),
+        hostParam,
+        portParam
+      );
     }
   }, [initialCode, onConnect]);
 
@@ -118,11 +188,16 @@ export const PhoneScanner: React.FC<PhoneScannerProps> = ({
             const hostParam = url.searchParams.get('host') || url.hostname;
             const portParam = url.port ? Number(url.port) : 3000;
             if (roomParam) {
-              onConnect({
-                roomCode: roomParam.toUpperCase().trim(),
-                host: hostParam && hostParam !== 'localhost' ? hostParam : undefined,
-                port: portParam,
-              });
+              connectToRoom(
+                roomParam.toUpperCase().trim(),
+                hostParam &&
+                hostParam !== 'localhost' &&
+                hostParam !== '127.0.0.1'
+                  ? hostParam
+                  : undefined,
+                portParam
+              );
+              setIsScanning(false);
               return;
             }
           } catch {
@@ -133,11 +208,12 @@ export const PhoneScanner: React.FC<PhoneScannerProps> = ({
           try {
             const parsed = JSON.parse(raw);
             if (parsed && (parsed.room || parsed.roomCode)) {
-              onConnect({
-                roomCode: (parsed.room || parsed.roomCode).toUpperCase().trim(),
-                host: parsed.host || undefined,
-                port: parsed.port ? Number(parsed.port) : 3000,
-              });
+              connectToRoom(
+                (parsed.room || parsed.roomCode).toUpperCase().trim(),
+                parsed.host || undefined,
+                parsed.port ? Number(parsed.port) : 3000
+              );
+              setIsScanning(false);
               return;
             }
           } catch {
@@ -146,7 +222,8 @@ export const PhoneScanner: React.FC<PhoneScannerProps> = ({
 
           // 3. Raw room code fallback
           if (raw.length >= 3 && raw.length <= 8) {
-            onConnect({ roomCode: raw.toUpperCase() });
+            connectToRoom(raw.toUpperCase());
+            setIsScanning(false);
             return;
           }
         }
@@ -170,11 +247,11 @@ export const PhoneScanner: React.FC<PhoneScannerProps> = ({
     const clean = code.toUpperCase().trim();
     if (clean.length >= 3) {
       sound.playClick();
-      onConnect({
-        roomCode: clean,
-        host: manualHost.trim() || undefined,
-        port: manualPort ? Number(manualPort) : 3000,
-      });
+      connectToRoom(
+        clean,
+        manualHost.trim() || undefined,
+        manualPort ? Number(manualPort) : 3000
+      );
     }
   };
 
@@ -237,6 +314,19 @@ export const PhoneScanner: React.FC<PhoneScannerProps> = ({
           <div className="w-full p-3.5 rounded-2xl bg-cyan-500/15 border border-cyan-500/40 text-cyan-200 text-xs flex items-center justify-center gap-2">
             <RefreshCw className="w-4 h-4 animate-spin text-cyan-400" />
             <span className="font-bold">جارٍ الاتصال بالتلفاز عبر الشبكة المحلية...</span>
+          </div>
+        )}
+
+        {isDiscovering && (
+          <div className="w-full p-3.5 rounded-2xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-200 text-xs flex items-center justify-center gap-2">
+            <Wifi className="w-4 h-4 animate-pulse text-emerald-400" />
+            <span className="font-bold">جارٍ البحث عن التلفاز داخل الشبكة المحلية...</span>
+          </div>
+        )}
+
+        {discoveryError && (
+          <div className="w-full p-3.5 rounded-2xl bg-amber-500/15 border border-amber-500/40 text-amber-200 text-xs text-center">
+            {discoveryError}
           </div>
         )}
 

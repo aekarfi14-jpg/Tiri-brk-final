@@ -19,6 +19,8 @@ export default function App() {
   const urlParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
   const initialMode = (urlParams?.get('mode') as AppMode) || 'select';
   const initialRoom = urlParams?.get('room') || '';
+  const initialHost = urlParams?.get('host') || '';
+  const initialPort = Number(urlParams?.get('port') || '3000');
 
   const [mode, setMode] = useState<AppMode>(initialMode);
   const [roomCode, setRoomCode] = useState<string>(initialRoom.toUpperCase());
@@ -43,8 +45,14 @@ export default function App() {
   const [phoneLatency, setPhoneLatency] = useState<number | null>(null);
 
   // Connection & Host Routing States
-  const [targetHost, setTargetHost] = useState<string>('');
-  const [targetPort, setTargetPort] = useState<number>(3000);
+  const [targetHost, setTargetHost] = useState<string>(initialHost);
+  const [targetPort, setTargetPort] = useState<number>(
+    Number.isFinite(initialPort) && initialPort > 0 ? initialPort : 3000
+  );
+
+  // TV server routing metadata
+  const [tvHost, setTvHost] = useState<string>('');
+  const [tvPort, setTvPort] = useState<number>(3000);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [phoneConnectionState, setPhoneConnectionState] = useState<
@@ -68,8 +76,37 @@ export default function App() {
   useEffect(() => {
     if (mode === 'tv') {
       startLocalHostServer(3000, roomCode || '7942').then((res) => {
-        if (res.roomCode && !roomCode) setRoomCode(res.roomCode);
-        if (res.port) setTargetPort(res.port);
+        if (!res.success) {
+          console.error('Failed to start local TV server');
+          return;
+        }
+
+        if (res.roomCode) {
+          setRoomCode(res.roomCode);
+        }
+
+        if (res.port) {
+          setTargetPort(res.port);
+          setTvPort(res.port);
+        }
+
+        if (res.host) {
+          setTvHost(res.host);
+        }
+
+        if (Array.isArray(res.localIps)) {
+      
+          // Prefer a real LAN IPv4 address for QR/join information.
+          if (
+            (!res.host ||
+              res.host === 'localhost' ||
+              res.host === '127.0.0.1' ||
+              res.host === '0.0.0.0') &&
+            res.localIps.length > 0
+          ) {
+            setTvHost(res.localIps[0]);
+          }
+        }
       });
     }
     return () => {
@@ -472,8 +509,19 @@ export default function App() {
   // Phone Actions
   const handlePhoneConnect = (payload: PhoneConnectionPayload) => {
     setRoomCode(payload.roomCode);
-    if (payload.host) setTargetHost(payload.host);
-    if (payload.port) setTargetPort(payload.port);
+
+    if (payload.host) {
+      setTargetHost(payload.host);
+    } else {
+      setTargetHost('');
+    }
+
+    if (payload.port) {
+      setTargetPort(payload.port);
+    } else {
+      setTargetPort(3000);
+    }
+
     setConnectionError(null);
     setIsConnecting(true);
     setPhoneConnectionState('CONNECTING');
@@ -556,6 +604,8 @@ export default function App() {
         {matchState === 'LOBBY' ? (
           <TvLobby
             roomCode={roomCode}
+                host={tvHost}
+                port={tvPort}
             players={tvPlayers}
             onStartMatch={handleTvStartMatch}
             onUpdatePlayer={handleTvUpdatePlayer}
