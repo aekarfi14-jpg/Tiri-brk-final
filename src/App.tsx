@@ -1,0 +1,666 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { FirstLaunchScreen } from './components/FirstLaunchScreen.tsx';
+import { TvLobby } from './components/tv/TvLobby.tsx';
+import { TvGameScreen } from './components/tv/TvGameScreen.tsx';
+import { PhoneScanner } from './components/phone/PhoneScanner.tsx';
+import { PhoneLobby } from './components/phone/PhoneLobby.tsx';
+import { PhoneController } from './components/phone/PhoneController.tsx';
+import { VirtualControllerModal } from './components/VirtualControllerModal.tsx';
+import { GameEngine } from './game/gameEngine.ts';
+import { MatchState, MatchSummary, PlayerInput, PlayerSlotData, TeamId, WeaponType } from './types.ts';
+import { sound } from './audio/soundEngine.ts';
+import { isNativeAndroid, startLocalHostServer, stopLocalHostServer } from './network/nativeServer.ts';
+import { PhoneConnectionPayload } from './components/phone/PhoneScanner.tsx';
+
+type AppMode = 'select' | 'tv' | 'phone';
+
+export default function App() {
+  // Check URL params on initial load
+  const urlParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
+  const initialMode = (urlParams?.get('mode') as AppMode) || 'select';
+  const initialRoom = urlParams?.get('room') || '';
+
+  const [mode, setMode] = useState<AppMode>(initialMode);
+  const [roomCode, setRoomCode] = useState<string>(initialRoom.toUpperCase());
+
+  // TV States
+  const [tvPlayers, setTvPlayers] = useState<PlayerSlotData[]>([]);
+  const [matchState, setMatchState] = useState<MatchState>('LOBBY');
+  const [matchSummary, setMatchSummary] = useState<MatchSummary | null>(null);
+  const engineRef = useRef<GameEngine | null>(null);
+
+  // Phone States
+  const [phoneSlot, setPhoneSlot] = useState<number | null>(null);
+  const [phonePlayerId, setPhonePlayerId] = useState<string>(() => {
+    return `phone_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  });
+  const [phoneName, setPhoneName] = useState<string>('Player 1');
+  const [phoneTeam, setPhoneTeam] = useState<TeamId>('RED');
+  const [phoneReady, setPhoneReady] = useState(false);
+  const [phoneHp, setPhoneHp] = useState(100);
+  const [phoneSelectedWeapon, setPhoneSelectedWeapon] = useState<WeaponType>('RIFLE');
+  const [isWsConnected, setIsWsConnected] = useState(false);
+  const [phoneLatency, setPhoneLatency] = useState<number | null>(null);
+
+  // Connection & Host Routing States
+  const [targetHost, setTargetHost] = useState<string>('');
+  const [targetPort, setTargetPort] = useState<number>(3000);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [phoneConnectionState, setPhoneConnectionState] = useState<
+    'IDLE' | 'CONNECTING' | 'CONNECTED' | 'RECONNECTING'
+  >('IDLE');
+
+  // Practice Mode tracking
+  const isPracticeRef = useRef<{ isPractice: boolean; botCount: number }>({
+    isPractice: false,
+    botCount: 0,
+  });
+
+  // Virtual Controller Simulator modal state (for preview testing)
+  const [simSlot, setSimSlot] = useState<number | null>(null);
+
+  // WebSocket Ref
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<any>(null);
+
+  // Auto-start Local Server when TV Mode is chosen
+  useEffect(() => {
+    if (mode === 'tv') {
+      startLocalHostServer(3000, roomCode || '7942').then((res) => {
+        if (res.roomCode && !roomCode) setRoomCode(res.roomCode);
+        if (res.port) setTargetPort(res.port);
+      });
+    }
+    return () => {
+      if (mode === 'tv') {
+        stopLocalHostServer();
+      }
+    };
+  }, [mode]);
+
+  // Initialize Authoritative Game Engine on TV
+  useEffect(() => {
+    if (!engineRef.current) {
+      const eng = new GameEngine();
+      eng.onStateChange = (state, summary) => {
+        setMatchState(state);
+        if (summary) setMatchSummary(summary);
+
+        // Broadcast match state to connected phones
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'tv:match_state',
+              matchState: state,
+              winnerTeam: summary?.winnerTeam || null,
+              winnerPlayers: summary?.winnerPlayers || [],
+            })
+          );
+        }
+      };
+
+      eng.onPhoneHaptic = (slot, effect, hp, maxHp) => {
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'tv:phone_haptic',
+              slot,
+              effect,
+              hp,
+              maxHp,
+            })
+          );
+        }
+      };
+
+      engineRef.current = eng;
+    }
+  }, []);
+
+  // Helper to get WebSocket URL
+  const getWsUrl = () => {
+    if (mode === 'phone' && targetHost) {
+      return `ws://${targetHost}:${targetPort || 3000}/ws`;
+    }
+    if (mode === 'tv' && isNativeAndroid()) {
+      return `ws://127.0.0.1:${targetPort || 3000}/ws`;
+    }
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.host}/ws`;
+  };
+
+  // Connect WebSocket
+  const connectWebSocket = useCallback(() => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
+
+    try {
+      const ws = new WebSocket(getWsUrl());
+
+      ws.onopen = () => {
+        setIsWsConnected(true);
+        setIsConnecting(false);
+        setPhoneConnectionState('CONNECTED');
+        setConnectionError(null);
+
+        if (mode === 'tv') {
+          // Register as TV host
+          ws.send(
+            JSON.stringify({
+              type: 'tv:create_room',
+              code: roomCode || undefined,
+            })
+          );
+        } else if (mode === 'phone' && roomCode) {
+          // Register as phone controller (sends playerId to reclaim reserved slot if reconnecting)
+          ws.send(
+            JSON.stringify({
+              type: 'phone:join_room',
+              code: roomCode,
+              playerId: phonePlayerId || undefined,
+              name: phoneName,
+              team: phoneTeam,
+            })
+          );
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+
+          // TV Messages
+          if (msg.type === 'tv:room_created') {
+            setRoomCode(msg.code);
+            if (msg.players) {
+              setTvPlayers(
+                msg.players.map((p: any) => ({
+                  slot: p.slot,
+                  id: p.id,
+                  name: p.name,
+                  team: p.team,
+                  ready: p.ready,
+                  connected: true,
+                }))
+              );
+            }
+          }
+
+          // Universal Roster Synchronization
+          if (msg.type === 'room:roster' && Array.isArray(msg.players)) {
+            setTvPlayers(
+              msg.players
+                .map((p: any) => ({
+                  slot: p.slot,
+                  id: p.id,
+                  name: p.name,
+                  team: p.team,
+                  ready: p.ready,
+                  connected: p.connected !== false,
+                }))
+                .sort((a: any, b: any) => a.slot - b.slot)
+            );
+          }
+
+          if (msg.type === 'player:joined') {
+            sound.playClick();
+            setTvPlayers((prev) => {
+              const filtered = prev.filter((p) => p.id !== msg.id && p.slot !== msg.slot);
+              return [
+                ...filtered,
+                {
+                  slot: msg.slot,
+                  id: msg.id,
+                  name: msg.name,
+                  team: msg.team,
+                  ready: msg.ready || false,
+                  connected: true,
+                },
+              ].sort((a, b) => a.slot - b.slot);
+            });
+          }
+
+          if (msg.type === 'player:disconnected') {
+            setTvPlayers((prev) =>
+              prev.map((p) => (p.id === msg.id || p.slot === msg.slot ? { ...p, connected: false } : p))
+            );
+          }
+
+          if (msg.type === 'player:reconnected') {
+            sound.playClick();
+            setTvPlayers((prev) =>
+              prev.map((p) =>
+                p.id === msg.id || p.slot === msg.slot
+                  ? {
+                      ...p,
+                      connected: true,
+                      name: msg.name || p.name,
+                      team: msg.team || p.team,
+                    }
+                  : p
+              )
+            );
+          }
+
+          if (msg.type === 'player:left') {
+            setTvPlayers((prev) => prev.filter((p) => p.id !== msg.id && p.slot !== msg.slot));
+          }
+
+          if (msg.type === 'player:updated') {
+            setTvPlayers((prev) =>
+              prev.map((p) =>
+                p.id === msg.id || p.slot === msg.slot
+                  ? { ...p, name: msg.name, team: msg.team, ready: msg.ready }
+                  : p
+              )
+            );
+          }
+
+          if (msg.type === 'player:input') {
+            if (engineRef.current && matchState !== 'LOBBY') {
+              engineRef.current.handleInput(msg.slot, msg.inputs);
+            }
+          }
+
+          // Phone Messages
+          if (msg.type === 'join:success') {
+            sound.playClick();
+            setPhoneSlot(msg.slot);
+            setPhonePlayerId(msg.playerId);
+            if (msg.name) setPhoneName(msg.name);
+            if (msg.team) setPhoneTeam(msg.team);
+            setMatchState(msg.matchState || 'LOBBY');
+            setConnectionError(null);
+            setIsConnecting(false);
+            setPhoneConnectionState('CONNECTED');
+          }
+
+          if (msg.type === 'join:error') {
+            setConnectionError(msg.message || 'Could not join room');
+            setIsConnecting(false);
+            setPhoneConnectionState('IDLE');
+            setPhoneSlot(null);
+          }
+
+          if (msg.type === 'profile:updated') {
+            if (msg.name) setPhoneName(msg.name);
+            if (msg.team) setPhoneTeam(msg.team);
+            if (typeof msg.ready === 'boolean') setPhoneReady(msg.ready);
+          }
+
+          if (msg.type === 'match:state') {
+            setMatchState(msg.matchState);
+            if (msg.matchState === 'ENDED') {
+              setMatchSummary({
+                winnerTeam: msg.winnerTeam,
+                winnerPlayers: msg.winnerNames || [],
+                durationSec: 0,
+              });
+            }
+          }
+
+          if (msg.type === 'haptic') {
+            if (typeof msg.hp === 'number') setPhoneHp(msg.hp);
+            if (msg.weapon) setPhoneSelectedWeapon(msg.weapon);
+            if (typeof navigator !== 'undefined' && navigator.vibrate) {
+              if (msg.effect === 'hit') navigator.vibrate(35);
+              else if (msg.effect === 'eliminated') navigator.vibrate([100, 50, 100]);
+              else if (msg.effect === 'shield') navigator.vibrate(20);
+            }
+          }
+
+          if (msg.type === 'pong') {
+            if (typeof msg.clientTime === 'number') {
+              const rtt = Math.round(performance.now() - msg.clientTime);
+              setPhoneLatency(rtt);
+            }
+          }
+
+          if (msg.type === 'kicked') {
+            setConnectionError(msg.reason || 'You were disconnected by the TV host.');
+            setPhoneSlot(null);
+            setRoomCode('');
+            setPhoneConnectionState('IDLE');
+          }
+
+          if (msg.type === 'tv:disconnected') {
+            setConnectionError(msg.message || 'انقطع اتصال شاشة التلفاز. في انتظار عودة المضيف...');
+          }
+        } catch (e) {
+          console.error('WS parse error:', e);
+        }
+      };
+
+      ws.onclose = () => {
+        setIsWsConnected(false);
+        if (mode === 'phone' && phoneSlot !== null) {
+          setPhoneConnectionState('RECONNECTING');
+        }
+        // Attempt reconnect after 2 seconds
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = setTimeout(connectWebSocket, 2000);
+      };
+
+      wsRef.current = ws;
+    } catch (e) {
+      console.error('WS connection error:', e);
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = setTimeout(connectWebSocket, 2500);
+    }
+  }, [mode, roomCode, phonePlayerId, phoneName, phoneTeam, matchState, targetHost, targetPort]);
+
+  // Connect whenever TV or Phone mode is chosen
+  useEffect(() => {
+    if (mode === 'tv') {
+      connectWebSocket();
+    } else if (mode === 'phone' && roomCode) {
+      connectWebSocket();
+    }
+
+    return () => {
+      clearTimeout(reconnectTimerRef.current);
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, [mode, roomCode, connectWebSocket]);
+
+  // Periodic Ping for Phone mode to measure latency and keep connection alive
+  useEffect(() => {
+    if (mode !== 'phone') return;
+    const interval = setInterval(() => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'ping',
+            clientTime: performance.now(),
+          })
+        );
+      }
+    }, 2500);
+
+    return () => clearInterval(interval);
+  }, [mode]);
+
+  // TV Host Actions
+  const handleTvStartMatch = () => {
+    if (!engineRef.current) return;
+    const connectedPlayers = tvPlayers.filter((p) => p.connected);
+    if (connectedPlayers.length === 0) return;
+    isPracticeRef.current.isPractice = false;
+    sound.playClick();
+    engineRef.current.initMatch(connectedPlayers);
+    setMatchState('PLAYING');
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'tv:match_state',
+          matchState: 'PLAYING',
+        })
+      );
+    }
+  };
+
+  const handleTvRematch = () => {
+    if (!engineRef.current) return;
+    sound.playClick();
+    const connectedPlayers = tvPlayers.filter((p) => p.connected);
+    if (connectedPlayers.length === 0) return;
+    engineRef.current.initMatch(connectedPlayers);
+    setMatchState('PLAYING');
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'tv:match_state',
+          matchState: 'PLAYING',
+        })
+      );
+    }
+  };
+
+  const handleTvReturnToLobby = () => {
+    sound.playClick();
+    isPracticeRef.current.isPractice = false;
+    setMatchState('LOBBY');
+    setMatchSummary(null);
+    if (engineRef.current) {
+      engineRef.current.matchState = 'LOBBY';
+      engineRef.current.particles.clear();
+      engineRef.current.projectiles = [];
+    }
+    sound.stopBattleMusic();
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'tv:match_state',
+          matchState: 'LOBBY',
+        })
+      );
+    }
+  };
+
+  const handleTvUpdatePlayer = (slot: number, name: string, team: TeamId) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'tv:update_player',
+          slot,
+          name,
+          team,
+        })
+      );
+    }
+    setTvPlayers((prev) =>
+      prev.map((p) => (p.slot === slot ? { ...p, name, team } : p))
+    );
+  };
+
+  const handleTvKickPlayer = (slot: number) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'tv:kick_player',
+          slot,
+        })
+      );
+    }
+    setTvPlayers((prev) => prev.filter((p) => p.slot !== slot));
+  };
+
+  // Phone Actions
+  const handlePhoneConnect = (payload: PhoneConnectionPayload) => {
+    setRoomCode(payload.roomCode);
+    if (payload.host) setTargetHost(payload.host);
+    if (payload.port) setTargetPort(payload.port);
+    setConnectionError(null);
+    setIsConnecting(true);
+    setPhoneConnectionState('CONNECTING');
+  };
+
+  const handlePhoneUpdateProfile = (name: string, team: TeamId) => {
+    setPhoneName(name);
+    setPhoneTeam(team);
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'phone:update_profile',
+          name,
+          team,
+        })
+      );
+    }
+  };
+
+  const handlePhoneToggleReady = (ready: boolean) => {
+    setPhoneReady(ready);
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'phone:update_profile',
+          ready,
+        })
+      );
+    }
+  };
+
+  const handlePhoneSendInput = (inputs: PlayerInput) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'phone:input',
+          inputs,
+        })
+      );
+    }
+  };
+
+  const handlePhoneDisconnect = () => {
+    sound.playClick();
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    setPhoneSlot(null);
+    setRoomCode('');
+    setConnectionError(null);
+    setPhoneConnectionState('IDLE');
+  };
+
+  // Feed simulated input directly to engine
+  const handleSimInput = (slot: number, inputs: PlayerInput) => {
+    if (engineRef.current) {
+      engineRef.current.handleInput(slot, inputs);
+    }
+  };
+
+  // 1. Initial Device Mode Selection Screen
+  if (mode === 'select') {
+    return (
+      <FirstLaunchScreen
+        onSelectMode={(selected) => {
+          setMode(selected);
+          const newUrl = new URL(window.location.href);
+          newUrl.searchParams.set('mode', selected);
+          window.history.replaceState({}, '', newUrl.toString());
+        }}
+      />
+    );
+  }
+
+  // 2. TV MODE
+  if (mode === 'tv') {
+    return (
+      <>
+        {matchState === 'LOBBY' ? (
+          <TvLobby
+            roomCode={roomCode}
+            players={tvPlayers}
+            onStartMatch={handleTvStartMatch}
+            onUpdatePlayer={handleTvUpdatePlayer}
+            onKickPlayer={handleTvKickPlayer}
+            onOpenPhoneSim={(slot) => setSimSlot(slot)}
+            onSwitchMode={() => {
+              setMode('select');
+              window.history.replaceState({}, '', window.location.pathname);
+            }}
+          />
+        ) : (
+          engineRef.current && (
+            <TvGameScreen
+              engine={engineRef.current}
+              matchState={matchState}
+              summary={matchSummary}
+              onRematch={handleTvRematch}
+              onReturnToLobby={handleTvReturnToLobby}
+              onOpenPhoneSim={(slot) => setSimSlot(slot)}
+            />
+          )
+        )}
+
+        {/* Virtual Gamepad Drawer/Modal for in-preview testing */}
+        {simSlot !== null && (
+          <VirtualControllerModal
+            slot={simSlot}
+            playerName={tvPlayers.find((p) => p.slot === simSlot)?.name || `Player ${simSlot}`}
+            playerTeam={tvPlayers.find((p) => p.slot === simSlot)?.team || 'RED'}
+            selectedWeapon="RIFLE"
+            hp={engineRef.current?.players.get(simSlot)?.hp ?? 100}
+            maxHp={100}
+            onSendInput={(inp) => handleSimInput(simSlot, inp)}
+            onClose={() => setSimSlot(null)}
+          />
+        )}
+      </>
+    );
+  }
+
+  // 3. PHONE MODE
+  if (mode === 'phone') {
+    if (!phoneSlot || !roomCode) {
+      return (
+        <PhoneScanner
+          initialCode={roomCode}
+          connectionError={connectionError}
+          isConnecting={isConnecting || phoneConnectionState === 'CONNECTING'}
+          onConnect={handlePhoneConnect}
+          onSwitchToTv={() => {
+            setMode('tv');
+            const newUrl = new URL(window.location.href);
+            newUrl.searchParams.set('mode', 'tv');
+            window.history.replaceState({}, '', newUrl.toString());
+          }}
+        />
+      );
+    }
+
+    return (
+      <>
+        {/* Reconnecting Overlay Banner */}
+        {phoneSlot !== null && !isWsConnected && (
+          <div className="fixed top-0 left-0 right-0 z-50 bg-amber-600 text-white text-xs px-4 py-2.5 flex items-center justify-between font-bold shadow-lg animate-pulse backdrop-blur-md">
+            <div className="flex items-center gap-2">
+              <span className="w-2.5 h-2.5 rounded-full bg-white animate-ping" />
+              <span>الاتصال انقطع، جارٍ إعادة الاتصال... (Reconnecting to TV)</span>
+            </div>
+            <button
+              onClick={handlePhoneDisconnect}
+              className="px-2.5 py-1 rounded bg-black/40 hover:bg-black/60 text-[10px] uppercase font-bold text-white transition-all cursor-pointer"
+            >
+              إلغاء • Cancel
+            </button>
+          </div>
+        )}
+
+        {matchState === 'LOBBY' ? (
+          <PhoneLobby
+            roomCode={roomCode}
+            slot={phoneSlot}
+            playerName={phoneName}
+            playerTeam={phoneTeam}
+            isReady={phoneReady}
+            isConnected={isWsConnected}
+            onUpdateProfile={handlePhoneUpdateProfile}
+            onToggleReady={handlePhoneToggleReady}
+            onDisconnect={handlePhoneDisconnect}
+          />
+        ) : (
+          <PhoneController
+            slot={phoneSlot}
+            playerName={phoneName}
+            playerTeam={phoneTeam}
+            selectedWeapon={phoneSelectedWeapon}
+            hp={phoneHp}
+            maxHp={100}
+            latencyMs={phoneLatency ?? undefined}
+            onSendInput={handlePhoneSendInput}
+            onDisconnect={handlePhoneDisconnect}
+          />
+        )}
+      </>
+    );
+  }
+
+  return null;
+}

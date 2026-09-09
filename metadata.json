@@ -1,0 +1,6 @@
+{
+  "name": "Tiri BRK",
+  "description": "Local LAN TV Host and Phone Controller Shooter Game",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
